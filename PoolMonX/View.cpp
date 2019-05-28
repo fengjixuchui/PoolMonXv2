@@ -65,30 +65,34 @@ void CView::LoadPoolTagText() {
 
 void CView::UpdatePoolTags() {
 	m_CellColors.clear();
+	ULONG size = 1 << 22;
 	if (m_PoolTags == nullptr) {
 		LoadPoolTagText();
-		m_PoolTags = static_cast<SYSTEM_POOLTAG_INFORMATION*>(::VirtualAlloc(nullptr, 1 << 22, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+		m_PoolTags = static_cast<SYSTEM_POOLTAG_INFORMATION*>(::VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
 		if (m_PoolTags == nullptr) {
 			AtlMessageBox(m_hWnd, L"Not enough memory");
-			m_Error = true;
+			PostQuitMessage(1);
 			return;
 		}
 	}
 	ULONG len;
-	auto status = NtQuerySystemInformation(SystemInformationClass::SystemPoolTagInformation, m_PoolTags, 1 << 22, &len);
+	auto status = NtQuerySystemInformation(SystemInformationClass::SystemPoolTagInformation, m_PoolTags, size, &len);
+
 	if (status) {
 		AtlMessageBox(m_hWnd, L"Failed in getting pool information");
-		m_Error = true;
+		PostQuitMessage(1);
 		return;
 	}
 
-	int count = m_PoolTags->Count;
+	auto count = m_PoolTags->Count;
 	if (m_Tags.empty()) {
 		m_Tags.reserve(count + 16);
 		m_TagsMap.reserve(count + 16);
 
-		for (auto i = 0; i < count; i++) {
+		for (decltype(count) i = 0; i < count; i++) {
 			const auto& info = m_PoolTags->TagInfo[i];
+			m_TotalPaged += info.PagedUsed;
+			m_TotalNonPaged += info.NonPagedUsed;
 			AddTag(info, i);
 		}
 		m_TagsView = m_Tags;
@@ -101,8 +105,11 @@ void CView::UpdatePoolTags() {
 		for (int i = 0; i < size; i++)
 			bitmap.insert(i);
 
-		for (auto i = 0; i < count; i++) {
+		m_TotalPaged = m_TotalNonPaged = 0;
+		for (decltype(count) i = 0; i < count; i++) {
 			const auto& info = m_PoolTags->TagInfo[i];
+			m_TotalPaged += info.PagedUsed;
+			m_TotalNonPaged += info.NonPagedUsed;
 
 			auto it = m_TagsMap.find(info.TagUlong);
 			if (it == m_TagsMap.end()) {
@@ -165,12 +172,14 @@ void CView::UpdateVisible() {
 }
 
 BOOL CView::PreTranslateMessage(MSG* pMsg) {
-	pMsg;
+	if (m_pFindDialog && m_pFindDialog->IsDialogMessageW(pMsg))
+		return TRUE;
+
 	return FALSE;
 }
 
 DWORD CView::OnPrePaint(int id, LPNMCUSTOMDRAW cd) {
-	return CDRF_NOTIFYITEMDRAW ;
+	return CDRF_NOTIFYITEMDRAW;
 }
 
 DWORD CView::OnItemPrePaint(int id, LPNMCUSTOMDRAW cd) {
@@ -195,8 +204,52 @@ DWORD CView::OnSubItemPrePaint(int id, LPNMCUSTOMDRAW cd) {
 
 BOOL CView::OnIdle() {
 	UIUpdateToolBar();
-
 	return FALSE;
+}
+
+LRESULT CView::OnFindDialogMessage(UINT msg, WPARAM wParam, LPARAM lParam, BOOL &) {
+	if (m_pFindDialog->IsTerminating()) {
+		m_pFindDialog = nullptr;
+		return 0;
+	}
+
+	auto searchDown = m_pFindDialog->SearchDown();
+	int start = GetSelectedIndex();
+	CString find(m_pFindDialog->GetFindString());
+	auto ignoreCase = !m_pFindDialog->MatchCase();
+	if (ignoreCase)
+		find.MakeLower();
+
+	int from = searchDown ? start + 1 : start - 1 + GetItemCount();
+	int to = searchDown ? GetItemCount() + start : start + 1;
+	int step = searchDown ? 1 : -1;
+
+	int findIndex = -1;
+	for (int i = from; i != to; i += step) {
+		int index = i % GetItemCount();
+		const auto& item = m_TagsView[index];
+		CString text(item->Tag);
+		if (ignoreCase)
+			text.MakeLower();
+		if (text.Find(find) >= 0) {
+			findIndex = index;
+			break;
+		}
+		text = item->SourceName;
+		if (ignoreCase)
+			text.MakeLower();
+		if (text.Find(find) >= 0) {
+			findIndex = index;
+			break;
+		}
+	}
+
+	if (findIndex >= 0)
+		SelectItem(findIndex);
+	else
+		AtlMessageBox(m_hWnd, L"Not found");
+
+	return 0;
 }
 
 LRESULT CView::OnCreate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled) {
@@ -210,9 +263,9 @@ LRESULT CView::OnCreate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
 	InsertColumn(ColumnType::PagedDiff, L"Paged Diff", LVCFMT_RIGHT, 80);
 	InsertColumn(ColumnType::PagedUsage, L"Paged Usage", LVCFMT_RIGHT, 100);
 
-	InsertColumn(ColumnType::NonPagedAllocs, L"Non Paged Allocs", LVCFMT_RIGHT, 100);
-	InsertColumn(ColumnType::NonPagedFrees, L"Non Paged Frees", LVCFMT_RIGHT, 100);
-	InsertColumn(ColumnType::NonPagedDiff, L"Non Paged Diff", LVCFMT_RIGHT, 80);
+	InsertColumn(ColumnType::NonPagedAllocs, L"Non Paged Allocs", LVCFMT_RIGHT, 120);
+	InsertColumn(ColumnType::NonPagedFrees, L"Non Paged Frees", LVCFMT_RIGHT, 120);
+	InsertColumn(ColumnType::NonPagedDiff, L"Non Paged Diff", LVCFMT_RIGHT, 100);
 	InsertColumn(ColumnType::NonPagedUsage, L"Non Paged Usage", LVCFMT_RIGHT, 100);
 
 	InsertColumn(ColumnType::SourceName, L"Source", LVCFMT_LEFT, 150);
@@ -221,6 +274,8 @@ LRESULT CView::OnCreate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
 	UpdatePoolTags();
 
 	UISetRadioMenuItem(ID_UPDATEINTERVAL_2SECONDS, ID_UPDATEINTERVAL_1SECOND, ID_UPDATEINTERVAL_10SECONDS);
+	UIEnable(ID_EDIT_COPY, FALSE);
+
 	SetTimer(1, m_UpdateInterval, nullptr);
 
 	CMessageLoop* pLoop = _Module.GetMessageLoop();
@@ -242,7 +297,6 @@ LRESULT CView::OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL & bHandle
 
 	CMessageLoop* pLoop = _Module.GetMessageLoop();
 	ATLASSERT(pLoop);
-	//pLoop->RemoveMessageFilter(this);
 	pLoop->RemoveIdleHandler(this);
 	bHandled = FALSE;
 
@@ -349,22 +403,69 @@ LRESULT CView::OnColumnClick(int, LPNMHDR nmhdr, BOOL &) {
 	return 0;
 }
 
-LRESULT CView::OnViewFilter(WORD, WORD, HWND, BOOL &) {
-	if (m_TagsView.size() == m_Tags.size()) {
-		for (size_t i = 0; i < m_TagsView.size(); i++) {
-			if (m_TagsView[i]->Tag.GetLength() > 0 && m_TagsView[i]->Tag[0] == L'S') {
-				m_TagsView.erase(m_TagsView.begin() + i);
-				i--;
+LRESULT CView::OnItemChanged(int, LPNMHDR, BOOL &) {
+	UIEnable(ID_EDIT_COPY, GetSelectedIndex() >= 0);
+
+	return 0;
+}
+
+LRESULT CView::OnFindItem(int, LPNMHDR nmhdr, BOOL &) {
+	auto fi = (NMLVFINDITEM*)nmhdr;
+	auto start = GetSelectedIndex() + 1;
+	auto count = GetItemCount();
+	CString text(fi->lvfi.psz);
+
+	if (fi->lvfi.flags & LVFI_STRING) {
+		for (int i = start; i < start + count; i++) {
+			if (CString(m_TagsView[i % count]->Tag).Mid(0, text.GetLength()).CompareNoCase(text) == 0) {
+				return i % count;
 			}
 		}
 	}
-	else {
-		m_TagsView = m_Tags;
+
+	return -1;
+}
+
+LRESULT CView::OnEditCopy(WORD, WORD, HWND, BOOL &) {
+	int selected = GetSelectedIndex();
+	ATLASSERT(selected >= 0);
+	CString line;
+	for (int i = 0; i < NumColumns; i++) {
+		CString text;
+		GetItemText(selected, i, text);
+		line += text;
+		if(i < NumColumns - 1)
+			line += L",";
 	}
 
-	DoSort();
-	SetItemCountEx((int)m_TagsView.size(), LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
-	UpdateVisible();
+	if (::OpenClipboard(m_hWnd)) {
+		::EmptyClipboard();
+		auto size = (line.GetLength() + 1) * sizeof(WCHAR);
+		auto hData = ::GlobalAlloc(GMEM_MOVEABLE, size);
+		if (hData) {
+			auto p = ::GlobalLock(hData);
+			if (p) {
+				::CopyMemory(p, (PCWSTR)line, size);
+				::GlobalUnlock(p);
+				::SetClipboardData(CF_UNICODETEXT, hData);
+			}
+		}
+		::CloseClipboard();
+	}
+	return 0;
+}
+
+LRESULT CView::OnEditFind(WORD, WORD, HWND, BOOL &) {
+	if (m_pFindDialog == nullptr) {
+		auto dlg = m_pFindDialog = new CFindReplaceDialog;
+		dlg->Create(TRUE, L"", nullptr, FR_DOWN | FR_NOWHOLEWORD, m_hWnd);
+		dlg->ShowWindow(SW_SHOW);
+	}
+	else {
+		m_pFindDialog->SetActiveWindow();
+		m_pFindDialog->SetFocus();
+	}
+
 	return 0;
 }
 
